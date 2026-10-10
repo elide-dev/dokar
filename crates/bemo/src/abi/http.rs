@@ -1964,6 +1964,25 @@ pub fn elide_transport_http_free(driver: u64, exchange: u64) -> i32 {
       abandon(state, exchange, false);
     }
     state.http.overflow.forget_exchange(exchange);
+    // Freeing forfeits every undelivered event naming the exchange, not only control events:
+    // EVENT_BODY names the exchange through its `value` and is not a control event, so
+    // forget_exchange leaves it behind. Strip it before the retirement decision so a cached
+    // address never carries a stale body event into a reused slot, and release each orphaned
+    // segment once on the driver thread, exactly as the driver-shutdown path does (retire below).
+    let stale_body_segments: Vec<u64> = state
+      .http
+      .overflow
+      .iter()
+      .filter(|event| event.kind == EVENT_BODY && event.value == exchange)
+      .map(|event| event.operation)
+      .collect();
+    state
+      .http
+      .overflow
+      .retain(|event| !(event.kind == EVENT_BODY && event.value == exchange));
+    for segment in &stale_body_segments {
+      state.http.segments.remove(segment);
+    }
     if let Some(http) = state.http.sockets.get_mut(&socket) {
       let queued = if let Some(parts) = http.ready.get_mut(&exchange) {
         // Buffered parts never report, and queue ownership already proves quarantine is needed.
@@ -2600,6 +2619,195 @@ mod tests {
     assert_eq!(elide_transport_driver_release(driver), 0);
     assert_eq!(elide_transport_buffer_release(original), 0);
     assert_eq!(elide_transport_buffer_release(batch), 0);
+    assert_eq!(elide_transport_owner_release(owner), 0);
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "native driver is unavailable under miri")]
+  fn free_mid_body_fails_to_clear_stale_event_body_before_id_reuse() {
+    let owner = elide_transport_owner_new(1024 * 1024);
+    let driver = elide_transport_driver_new(owner, Backend::Auto as u32, 8);
+    let socket = identity();
+    let budget = budget(owner).unwrap();
+    let head_and_partial = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n12345";
+    // Step 1: feed the request head plus a partial body; both events go to overflow.
+    let (exchange, stale_segment) = {
+      let mut events = VecDeque::new();
+      DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let state = drivers.0.get_mut(&driver).unwrap();
+        let http = HttpSocket::new(budget.clone(), 1024, None);
+        state.http.sockets.insert(socket, http);
+        let mut buf = Buffer::new(head_and_partial.len(), budget.clone()).unwrap();
+        buf.write(0, head_and_partial).unwrap();
+        process_input(state, socket, buf.freeze(), &mut events);
+        state.http.overflow.extend(events.drain(..));
+      });
+      DRIVERS.with(|drivers| {
+        let drivers = drivers.borrow();
+        let state = drivers.0.get(&driver).unwrap();
+        let request = state
+          .http
+          .overflow
+          .iter()
+          .find(|e| e.kind == EVENT_REQUEST)
+          .expect("EVENT_REQUEST emitted");
+        let body = state
+          .http
+          .overflow
+          .iter()
+          .find(|e| e.kind == EVENT_BODY)
+          .expect("EVENT_BODY emitted for the partial body");
+        (request.value, body.operation)
+      })
+    };
+    // Step 2: free the exchange while the body is mid-stream.
+    assert_eq!(elide_transport_http_free(driver, exchange), 0);
+    // Step 3: the stale EVENT_BODY naming the freed exchange must be forfeited from overflow, and
+    // its orphaned segment released once on the driver thread (the guest never received the event).
+    let stale_body_remains = DRIVERS.with(|drivers| {
+      let drivers = drivers.borrow();
+      let state = drivers.0.get(&driver).unwrap();
+      state
+        .http
+        .overflow
+        .iter()
+        .any(|e| e.kind == EVENT_BODY && e.value == exchange && e.operation == stale_segment)
+    });
+    assert!(
+      !stale_body_remains,
+      "freeing must forfeit every undelivered EVENT_BODY naming the exchange, not only controls"
+    );
+    let segment_released = DRIVERS.with(|drivers| {
+      let drivers = drivers.borrow();
+      let state = drivers.0.get(&driver).unwrap();
+      !state.http.segments.contains_key(&stale_segment)
+    });
+    assert!(
+      segment_released,
+      "the orphaned body segment must be released on the driver thread, not leaked"
+    );
+    // Step 4: feed a GET on a fresh socket; insert may reuse the cached address.
+    let socket2 = identity();
+    let mut events = VecDeque::new();
+    DRIVERS.with(|drivers| {
+      let mut drivers = drivers.borrow_mut();
+      let state = drivers.0.get_mut(&driver).unwrap();
+      let http = HttpSocket::new(budget.clone(), 1024, None);
+      state.http.sockets.insert(socket2, http);
+      let mut buf = Buffer::new(b"GET /next HTTP/1.1\r\nHost: a\r\n\r\n".len(), budget.clone()).unwrap();
+      buf.write(0, b"GET /next HTTP/1.1\r\nHost: a\r\n\r\n").unwrap();
+      process_input(state, socket2, buf.freeze(), &mut events);
+      state.http.overflow.extend(events.drain(..));
+    });
+    let reused = DRIVERS.with(|drivers| {
+      let drivers = drivers.borrow();
+      let state = drivers.0.get(&driver).unwrap();
+      state
+        .http
+        .overflow
+        .iter()
+        .find(|e| e.kind == EVENT_REQUEST && e.value != 0)
+        .map(|e| e.value)
+        .expect("a new EVENT_REQUEST")
+    });
+    let collided = reused == exchange && stale_body_remains;
+    // cleanup
+    DRIVERS.with(|drivers| {
+      let mut drivers = drivers.borrow_mut();
+      let state = drivers.0.get_mut(&driver).unwrap();
+      let mut ev = VecDeque::new();
+      close_socket(state, socket2, &mut ev);
+      state.http.overflow.extend(ev);
+    });
+    assert_eq!(elide_transport_driver_release(driver), 0);
+    assert_eq!(elide_transport_owner_release(owner), 0);
+    assert!(
+      !collided,
+      "stale EVENT_BODY(segment={:#x}, exchange={:#x}) coexists with a new EVENT_REQUEST reusing {:#x}: \
+       forget_exchange leaves EVENT_BODY behind and retire(false) caches the id",
+      stale_segment, exchange, exchange
+    );
+  }
+
+  /// The already-responded free path (`abandon` not taken) must still strip a stale `EVENT_BODY`
+  /// naming the freed exchange and release its segment before retirement.
+  #[test]
+  #[cfg_attr(miri, ignore = "native driver is unavailable under miri")]
+  fn free_after_response_strips_stale_event_body_and_releases_segment() {
+    let owner = elide_transport_owner_new(1024 * 1024);
+    let driver = elide_transport_driver_new(owner, Backend::Auto as u32, 8);
+    let socket = identity();
+    let budget = budget(owner).unwrap();
+    let head_and_partial = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 10\r\n\r\n12345";
+    let (exchange, stale_segment) = {
+      let mut events = VecDeque::new();
+      DRIVERS.with(|drivers| {
+        let mut drivers = drivers.borrow_mut();
+        let state = drivers.0.get_mut(&driver).unwrap();
+        let http = HttpSocket::new(budget.clone(), 1024, None);
+        state.http.sockets.insert(socket, http);
+        let mut buf = Buffer::new(head_and_partial.len(), budget.clone()).unwrap();
+        buf.write(0, head_and_partial).unwrap();
+        process_input(state, socket, buf.freeze(), &mut events);
+        state.http.overflow.extend(events.drain(..));
+      });
+      DRIVERS.with(|drivers| {
+        let drivers = drivers.borrow();
+        let state = drivers.0.get(&driver).unwrap();
+        let request = state
+          .http
+          .overflow
+          .iter()
+          .find(|e| e.kind == EVENT_REQUEST)
+          .expect("EVENT_REQUEST emitted");
+        let body = state
+          .http
+          .overflow
+          .iter()
+          .find(|e| e.kind == EVENT_BODY)
+          .expect("EVENT_BODY emitted for the partial body");
+        (request.value, body.operation)
+      })
+    };
+    // Mark the exchange as already responded (the `else` branch in free: abandon is not taken),
+    // while a body segment remains undelivered in overflow.
+    DRIVERS.with(|drivers| {
+      let mut drivers = drivers.borrow_mut();
+      let state = drivers.0.get_mut(&driver).unwrap();
+      state.http.exchanges.get_mut(&exchange).unwrap().responded = true;
+    });
+    assert_eq!(elide_transport_http_free(driver, exchange), 0);
+    let stale_body_remains = DRIVERS.with(|drivers| {
+      let drivers = drivers.borrow();
+      let state = drivers.0.get(&driver).unwrap();
+      state
+        .http
+        .overflow
+        .iter()
+        .any(|e| e.kind == EVENT_BODY && e.value == exchange)
+    });
+    assert!(
+      !stale_body_remains,
+      "already-responded free must still forfeit undelivered EVENT_BODY naming the exchange"
+    );
+    let segment_released = DRIVERS.with(|drivers| {
+      let drivers = drivers.borrow();
+      let state = drivers.0.get(&driver).unwrap();
+      !state.http.segments.contains_key(&stale_segment)
+    });
+    assert!(
+      segment_released,
+      "already-responded free must release the orphaned segment on the driver thread"
+    );
+    let mut ev = VecDeque::new();
+    DRIVERS.with(|drivers| {
+      let mut drivers = drivers.borrow_mut();
+      let state = drivers.0.get_mut(&driver).unwrap();
+      close_socket(state, socket, &mut ev);
+      state.http.overflow.extend(ev);
+    });
+    assert_eq!(elide_transport_driver_release(driver), 0);
     assert_eq!(elide_transport_owner_release(owner), 0);
   }
 }
