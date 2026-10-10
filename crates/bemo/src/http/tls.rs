@@ -230,16 +230,23 @@ impl Lane {
 }
 
 fn saves_record(first: usize, remaining: &[FrozenBuffer]) -> bool {
-  let (bytes, records) = remaining
+  let separate = remaining
     .iter()
-    .fold((first, first.div_ceil(RECORD_PLAINTEXT)), |(bytes, records), part| {
-      let length = part.as_ref().len();
-      (
-        bytes.saturating_add(length),
-        records.saturating_add(length.div_ceil(RECORD_PLAINTEXT)),
-      )
+    .fold(first.div_ceil(RECORD_PLAINTEXT), |records, part| {
+      records.saturating_add(part.as_ref().len().div_ceil(RECORD_PLAINTEXT))
     });
-  records > bytes.div_ceil(RECORD_PLAINTEXT)
+  let staged = remaining.iter().fold(first, |length, part| {
+    length.saturating_add(part.as_ref().len()).min(RECORD_PLAINTEXT)
+  });
+  let mut leftover = staged - first;
+  let mut remainder = 0;
+  for part in remaining {
+    let len = part.as_ref().len();
+    let consumed = len.min(leftover);
+    remainder += (len - consumed).div_ceil(RECORD_PLAINTEXT);
+    leftover -= consumed;
+  }
+  separate > 1 + remainder
 }
 
 #[cfg(test)]
@@ -250,6 +257,10 @@ mod tests {
   use std::sync::Arc;
 
   fn pair() -> (Lane, rustls::ClientConnection) {
+    pair_with_budget(Budget::new(1024 * 1024))
+  }
+
+  fn pair_with_budget(budget: Budget) -> (Lane, rustls::ClientConnection) {
     let cert = CertificateDer::from_pem_slice(include_bytes!("../../tests/fixtures/localhost-cert.pem")).unwrap();
     let key = PrivateKeyDer::from_pem_slice(include_bytes!("../../tests/fixtures/localhost-key.pem")).unwrap();
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
@@ -269,7 +280,7 @@ mod tests {
       .unwrap();
     server.alpn_protocols = vec![b"http/1.1".to_vec()];
     (
-      Lane::new(Arc::new(server), Budget::new(1024 * 1024)).unwrap(),
+      Lane::new(Arc::new(server), budget).unwrap(),
       rustls::ClientConnection::new(Arc::new(client), ServerName::try_from("localhost").unwrap()).unwrap(),
     )
   }
@@ -278,6 +289,14 @@ mod tests {
     let mut result = Buffer::new(data.len().max(1), Budget::new(1024 * 1024)).unwrap();
     result.write(0, data).unwrap();
     result
+  }
+
+  fn frozen(len: usize) -> FrozenBuffer {
+    if len == 0 {
+      bytes(&[]).freeze()
+    } else {
+      bytes(&vec![0; len]).freeze()
+    }
   }
 
   #[test]
@@ -412,5 +431,91 @@ mod tests {
       assert_eq!(&received[..128], &[b'h'; 128]);
       assert_eq!(&received[128..], vec![b'b'; body_length]);
     }
+  }
+
+  #[test]
+  fn saves_record_false_when_exact_multiple_prevents_savings() {
+    assert!(!saves_record(100, &[frozen(32768), frozen(100)]));
+    assert!(!saves_record(50, &[frozen(32768), frozen(50)]));
+    assert!(!saves_record(1, &[frozen(49152), frozen(1)]));
+  }
+
+  #[test]
+  fn saves_record_true_when_staging_merges_small_parts() {
+    assert!(saves_record(100, &[frozen(100)]));
+    assert!(saves_record(200, &[frozen(200)]));
+  }
+
+  #[test]
+  fn saves_record_false_with_no_remaining() {
+    assert!(!saves_record(100, &[]));
+    assert!(!saves_record(RECORD_PLAINTEXT, &[]));
+  }
+
+  #[test]
+  fn saves_record_false_when_first_fills_a_record() {
+    assert!(!saves_record(RECORD_PLAINTEXT, &[frozen(100)]));
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "rustls handshakes call into AWS-LC")]
+  fn shared_budget_exact_multiple_parts_do_not_exhaust_connection() {
+    let budget = Budget::new(50000);
+    let (mut lane, mut client) = pair_with_budget(budget.clone());
+    for _ in 0..100 {
+      let mut wire = Vec::new();
+      client.write_tls(&mut wire).unwrap();
+      if !wire.is_empty() {
+        lane.feed(bytes(&wire)).unwrap();
+      }
+      match lane.progress().unwrap() {
+        Progress::Output(output) => {
+          let mut wire = Cursor::new(output.as_ref());
+          while wire.position() < output.as_ref().len() as u64 {
+            client.read_tls(&mut wire).unwrap();
+            client.process_new_packets().unwrap();
+          }
+          lane.transmitted();
+        }
+        Progress::Blocked if !client.is_handshaking() && !lane.is_handshaking() => break,
+        Progress::Blocked => {}
+        _ => panic!("unexpected handshake progress"),
+      }
+    }
+    assert!(!lane.is_handshaking());
+    let mut p1 = Buffer::new(100, budget.clone()).unwrap();
+    p1.write(0, &[b'a'; 100]).unwrap();
+    let mut p2 = Buffer::new(32768, budget.clone()).unwrap();
+    p2.write(0, &vec![b'b'; 32768]).unwrap();
+    let mut p3 = Buffer::new(100, budget).unwrap();
+    p3.write(0, &[b'c'; 100]).unwrap();
+    lane.enqueue(vec![p1.freeze(), p2.freeze(), p3.freeze()]);
+    let mut received = Vec::new();
+    loop {
+      match lane.progress().unwrap() {
+        Progress::Output(output) => {
+          assert!(matches!(lane.progress().unwrap(), Progress::Blocked));
+          let mut wire = Cursor::new(output.as_ref());
+          while wire.position() < output.as_ref().len() as u64 {
+            client.read_tls(&mut wire).unwrap();
+            client.process_new_packets().unwrap();
+            let mut chunk = [0; RECORD_PLAINTEXT];
+            while let Ok(length) = client.reader().read(&mut chunk) {
+              if length == 0 {
+                break;
+              }
+              received.extend_from_slice(&chunk[..length]);
+            }
+          }
+          lane.transmitted();
+        }
+        Progress::Complete(_) => break,
+        _ => panic!("unexpected application progress"),
+      }
+    }
+    assert_eq!(received.len(), 32968);
+    assert_eq!(&received[..100], &[b'a'; 100]);
+    assert_eq!(&received[100..32868], &vec![b'b'; 32768]);
+    assert_eq!(&received[32868..], &[b'c'; 100]);
   }
 }
