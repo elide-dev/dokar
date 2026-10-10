@@ -590,10 +590,6 @@ impl Engine {
   pub fn close_outbound(&mut self) {
     self.started = true;
     self.pending.close_requested = true;
-    if self.is_handshaking() {
-      // Rustls exposes close-notify only once application traffic is permitted.
-      self.pending.close_queued = true;
-    }
   }
 
   /// Stop accepting records; returns whether the peer's close-notify is missing after the handshake
@@ -905,6 +901,113 @@ mod tests {
     wire.clear();
     assert!(!server.close_inbound());
     assert!(client.close_inbound());
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "rustls handshakes call into AWS-LC")]
+  fn engine_close_outbound_during_handshake_emits_close_notify_after_completion() {
+    for versions in [&[&rustls::version::TLS13][..], &[&rustls::version::TLS12][..]] {
+      let (mut client, mut server) = pair(versions, "localhost");
+
+      let mut to_server = Vec::new();
+      drain(&mut client, &[], &mut to_server).unwrap();
+      assert!(client.is_handshaking());
+
+      feed(&mut server, &mut to_server, &mut Vec::new()).unwrap();
+      let mut to_client = Vec::new();
+      drain(&mut server, &[], &mut to_client).unwrap();
+
+      client.close_outbound();
+      assert!(
+        !client.outbound_done(),
+        "outbound not done: close-notify not yet queued"
+      );
+
+      feed(&mut client, &mut to_client, &mut Vec::new()).unwrap();
+
+      if versions[0] == &rustls::version::TLS12 {
+        let mut to_server = Vec::new();
+        drain(&mut client, &[], &mut to_server).unwrap();
+        feed(&mut server, &mut to_server, &mut Vec::new()).unwrap();
+        let mut to_client = Vec::new();
+        drain(&mut server, &[], &mut to_client).unwrap();
+        feed(&mut client, &mut to_client, &mut Vec::new()).unwrap();
+      }
+
+      assert!(!client.is_handshaking(), "client handshake completed");
+      assert!(
+        !client.outbound_done(),
+        "outbound not done until close-notify is handed to caller"
+      );
+
+      let mut wire = Vec::new();
+      drain(&mut client, &[], &mut wire).unwrap();
+      assert!(!wire.is_empty(), "client emitted Finished flight and close-notify");
+      assert!(client.outbound_done(), "outbound done after close-notify emitted");
+
+      let mut received = Vec::new();
+      feed(&mut server, &mut wire, &mut received).unwrap();
+      assert!(!server.is_handshaking(), "server handshake completed");
+      assert!(server.inbound_done(), "peer received close-notify");
+      assert!(server.failure().is_none());
+    }
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "rustls handshakes call into AWS-LC")]
+  fn engine_close_outbound_during_handshake_abi_state_not_contradictory() {
+    let (mut client, _server) = pair(&[&rustls::version::TLS13], "localhost");
+    let mut to_server = Vec::new();
+    drain(&mut client, &[], &mut to_server).unwrap();
+    assert!(client.is_handshaking());
+
+    client.close_outbound();
+
+    assert!(
+      !client.outbound_done(),
+      "outbound_done must be false while close-notify is not yet emitted"
+    );
+    assert!(client.is_handshaking(), "handshake must still be in progress");
+
+    let hs = client.handshake_status();
+    assert!(
+      hs != Handshake::NotHandshaking,
+      "handshake status must not report settled while still handshaking"
+    );
+  }
+
+  #[test]
+  #[cfg_attr(miri, ignore = "rustls handshakes call into AWS-LC")]
+  fn engine_close_outbound_during_handshake_outbound_stays_open_until_wrap() {
+    let (mut client, mut server) = pair(&[&rustls::version::TLS13], "localhost");
+
+    let mut to_server = Vec::new();
+    drain(&mut client, &[], &mut to_server).unwrap();
+    assert!(client.is_handshaking());
+
+    feed(&mut server, &mut to_server, &mut Vec::new()).unwrap();
+    let mut to_client = Vec::new();
+    drain(&mut server, &[], &mut to_client).unwrap();
+
+    client.close_outbound();
+
+    feed(&mut client, &mut to_client, &mut Vec::new()).unwrap();
+    assert!(!client.is_handshaking());
+    assert!(!client.outbound_done());
+
+    assert_eq!(
+      client.handshake_status(),
+      Handshake::NeedWrap,
+      "engine must prompt a wrap to queue and emit close-notify"
+    );
+
+    let mut wire = Vec::new();
+    drain(&mut client, &[], &mut wire).unwrap();
+    assert!(client.outbound_done());
+
+    let mut received = Vec::new();
+    feed(&mut server, &mut wire, &mut received).unwrap();
+    assert!(server.inbound_done());
   }
 
   #[test]
