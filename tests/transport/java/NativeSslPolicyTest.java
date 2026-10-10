@@ -9,9 +9,11 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Arrays;
 import java.util.List;
+import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLEngine;
 import javax.net.ssl.SSLEngineResult;
 import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLParameters;
 
 /** Immutable TLS policy contract, without sockets or a transport driver. */
 public final class NativeSslPolicyTest {
@@ -97,6 +99,7 @@ public final class NativeSslPolicyTest {
       }
       rejectPeerPolicy(api, owner, cert, key, "TLSv1.2", "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256");
       rejectPeerPolicy(api, owner, cert, key, "TLSv1.3", "TLS_AES_256_GCM_SHA384");
+      sslParametersSniRoundTrip(api, owner, cert, key);
       invalid(() -> NativeSslContextBuilder.forClient(api).protocols());
       invalid(() -> NativeSslContextBuilder.forClient(api).protocols("TLSv1.1"));
       invalid(() -> NativeSslContextBuilder.forClient(api).protocols("TLSv1.3", "TLSv1.3"));
@@ -155,6 +158,115 @@ public final class NativeSslPolicyTest {
       serverContext.release();
     }
     require(api.ownerUsed(owner) == 0, "failed policy handshake returned engine storage");
+  }
+
+  /**
+   * SSLParameters SNI round-trip: getSSLParameters/setSSLParameters on a client engine must be
+   * symmetric. A get→set round-trip, or a direct set with value-equal SNI, must be a no-op after
+   * the engine starts. Genuine SNI changes after start must still throw.
+   */
+  private static void sslParametersSniRoundTrip(
+      TransportNative api, long owner, byte[] cert, byte[] key) throws Exception {
+    NativeSslContext clientContext =
+        NativeSslContextBuilder.forClient(api).workload(owner).trustAnchors(cert).build();
+    NativeSslContext serverContext =
+        NativeSslContextBuilder.forServer(api, cert, key).workload(owner).build();
+    try {
+      // Case 1: Get→Set round-trip after handshake start (the reported bug).
+      SSLEngine client =
+          clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT, "localhost", 443);
+      try {
+        client.beginHandshake();
+        SSLParameters params = client.getSSLParameters();
+        require(params.getServerNames() != null, "getSSLParameters synthesizes SNI for hostname");
+        require(
+            params.getServerNames().equals(List.of(new SNIHostName("localhost"))),
+            "synthesized SNI matches peer host");
+        client.setSSLParameters(params);
+      } finally {
+        ReferenceCountUtil.release(client);
+      }
+
+      // Case 2: Direct set with value-equal SNI after start, without prior get.
+      SSLEngine client2 =
+          clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT, "localhost", 443);
+      try {
+        client2.beginHandshake();
+        SSLParameters p = new SSLParameters();
+        p.setServerNames(List.of(new SNIHostName("localhost")));
+        client2.setSSLParameters(p);
+        client2.setSSLParameters(p);
+      } finally {
+        ReferenceCountUtil.release(client2);
+      }
+
+      // Case 3: Genuine SNI change after start must still throw.
+      SSLEngine client3 =
+          clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT, "localhost", 443);
+      try {
+        client3.beginHandshake();
+        SSLParameters p = new SSLParameters();
+        p.setServerNames(List.of(new SNIHostName("example.com")));
+        try {
+          client3.setSSLParameters(p);
+          throw new AssertionError("SNI change after start accepted");
+        } catch (IllegalStateException expected) {
+          require(
+              expected.getMessage().contains("server names cannot change"),
+              "SNI change diagnostic");
+        }
+      } finally {
+        ReferenceCountUtil.release(client3);
+      }
+
+      // Case 4: SNI can be freely changed before the engine starts (handle == 0).
+      SSLEngine client4 =
+          clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT, "localhost", 443);
+      try {
+        SSLParameters params = client4.getSSLParameters();
+        require(params.getServerNames() != null, "SNI synthesized before handshake");
+        client4.setSSLParameters(params);
+        SSLParameters changed = new SSLParameters();
+        changed.setServerNames(List.of(new SNIHostName("example.com")));
+        client4.setSSLParameters(changed);
+        require(
+            client4
+                .getSSLParameters()
+                .getServerNames()
+                .equals(List.of(new SNIHostName("example.com"))),
+            "SNI changed before start");
+      } finally {
+        ReferenceCountUtil.release(client4);
+      }
+
+      // Case 5: IP-literal peer host: no SNI synthesis, round-trip is harmless.
+      SSLEngine client5 =
+          clientContext.newEngine(UnpooledByteBufAllocator.DEFAULT, "127.0.0.1", 443);
+      try {
+        client5.beginHandshake();
+        SSLParameters params = client5.getSSLParameters();
+        require(params.getServerNames() == null, "no SNI synthesized for IP literal");
+        client5.setSSLParameters(params);
+      } finally {
+        ReferenceCountUtil.release(client5);
+      }
+
+      // Case 6: Server engine: no SNI synthesis, round-trip is harmless.
+      SSLEngine server = serverContext.newEngine(UnpooledByteBufAllocator.DEFAULT);
+      try {
+        server.beginHandshake();
+        SSLParameters params = server.getSSLParameters();
+        require(params.getServerNames() == null, "no SNI synthesized for server engine");
+        server.setSSLParameters(params);
+      } finally {
+        ReferenceCountUtil.release(server);
+      }
+    } finally {
+      clientContext.release();
+      serverContext.release();
+    }
+    require(api.ownerUsed(owner) == 0, "SNI round-trip returned engine storage");
+    System.out.println("Native TLS SSLParameters SNI round-trip checks passed");
   }
 
   private static void handshake(SSLEngine client, SSLEngine server) throws Exception {

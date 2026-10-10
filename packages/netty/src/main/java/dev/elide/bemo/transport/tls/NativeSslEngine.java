@@ -505,9 +505,13 @@ public final class NativeSslEngine extends ApplicationProtocolSslEngine
     parameters.setEndpointIdentificationAlgorithm(endpointIdentification);
     parameters.setApplicationProtocols(context.applicationProtocols().toArray(new String[0]));
     parameters.setUseCipherSuitesOrder(true);
-    if (serverNames != null) parameters.setServerNames(serverNames);
-    else if (context.isClient() && serverName() != null && !isIpLiteral(serverName()))
-      parameters.setServerNames(List.of(new SNIHostName(serverName())));
+    if (serverNames != null) {
+      parameters.setServerNames(serverNames);
+    } else if (context.isClient() && serverName() != null && !isIpLiteral(serverName())) {
+      List<SNIServerName> materialized = List.of(new SNIHostName(serverName()));
+      serverNames = materialized;
+      parameters.setServerNames(materialized);
+    }
     return parameters;
   }
 
@@ -529,7 +533,12 @@ public final class NativeSslEngine extends ApplicationProtocolSslEngine
     endpointIdentification = parameters.getEndpointIdentificationAlgorithm();
     List<SNIServerName> names = parameters.getServerNames();
     if (names != null) {
-      if (handle != 0 && !names.equals(serverNames))
+      List<SNIServerName> current = serverNames;
+      if (current == null
+          && context.isClient()
+          && serverName() != null
+          && !isIpLiteral(serverName())) current = List.of(new SNIHostName(serverName()));
+      if (handle != 0 && !names.equals(current))
         throw new IllegalStateException("TLS server names cannot change after the engine starts");
       serverNames = List.copyOf(names);
     }
