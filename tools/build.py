@@ -240,9 +240,9 @@ def test_transport(native_image=False, reports=None, agent=()):
   else:
     for contract in ("FfmTransportTest", "NativeByteBufTest", "NativeChannelTest", "NativeLifecycleTest",
                      "NativeTlsChannelTest", "NativeTlsNegativeTest", "NativeTlsOrderingTest",
-                     "NativeTransferTest", "NativeJfrTest", "NativeReentrantCloseTest",
-                     "NativeReceiveAllocatorTest", "NativeSslEngineTest", "NativeSslInteropTest",
-                     "NativeSslPolicyTest", "StandaloneTransportCheck"):
+                     "NativeTlsClosePromiseTest", "NativeTransferTest", "NativeJfrTest",
+                     "NativeReentrantCloseTest", "NativeReceiveAllocatorTest", "NativeSslEngineTest",
+                     "NativeSslInteropTest", "NativeSslPolicyTest", "StandaloneTransportCheck"):
       reports.run(contract, [os.environ.get("BEMO_TEST_JAVA", java_tool("java")), *agent,
           "--enable-native-access=ALL-UNNAMED", "-ea", "-cp", classpath([output, *cp]),
           contract, library(), cert, key], timeout=90, cwd=ROOT)

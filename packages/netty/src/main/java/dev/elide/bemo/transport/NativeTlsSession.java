@@ -6,6 +6,7 @@ package dev.elide.bemo.transport;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelOutboundBuffer;
+import io.netty.channel.ChannelPromise;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
@@ -92,7 +93,12 @@ final class NativeTlsSession implements AutoCloseable {
         channel
             .eventLoop()
             .schedule(
-                () -> channel.finishTlsClose(promise), 5, java.util.concurrent.TimeUnit.SECONDS);
+                () -> {
+                  closePromise = null;
+                  channel.finishTlsClose(promise);
+                },
+                5,
+                java.util.concurrent.TimeUnit.SECONDS);
     pump();
   }
 
@@ -117,9 +123,10 @@ final class NativeTlsSession implements AutoCloseable {
     wire = 0;
     if (closeRecord) {
       if (!outputOnly) {
+        ChannelPromise p = closePromise;
+        closePromise = null;
         channel.finishTlsClose(
-            java.util.Objects.requireNonNull(
-                closePromise, "close record requires a close promise"));
+            java.util.Objects.requireNonNull(p, "close record requires a close promise"));
         return;
       }
       java.util.Objects.requireNonNull(
@@ -281,7 +288,9 @@ final class NativeTlsSession implements AutoCloseable {
           return;
         }
         if (state == 6) {
-          channel.finishTlsClose(closePromise == null ? channel.voidPromise() : closePromise);
+          ChannelPromise p = closePromise;
+          closePromise = null;
+          channel.finishTlsClose(p == null ? channel.voidPromise() : p);
           return;
         }
         if (state == 3 && length == 0) {
@@ -313,6 +322,11 @@ final class NativeTlsSession implements AutoCloseable {
   public void close() {
     if (closed) return;
     closed = true;
+    if (closePromise != null) {
+      ChannelPromise p = closePromise;
+      closePromise = null;
+      if (!p.isDone() && !p.isVoid()) p.tryFailure(new java.nio.channels.ClosedChannelException());
+    }
     if (closeTimeout != null)
       java.util.Objects.requireNonNull(
               closeTimeout, "close timeout is armed before sending close_notify")
