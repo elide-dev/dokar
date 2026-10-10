@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.1](https://github.com/elide-dev/bemo/compare/v0.3.0...v0.3.1) (2026-10-10)
+
+
+### Bug Fixes
+
+* **h2:** force-reset freed streams stalled by withheld flow-control credit ([#31](https://github.com/elide-dev/bemo/issues/31)) ([9092110](https://github.com/elide-dev/bemo/commit/9092110b2fbb83c5ea269d3aae1439868053865f))
+* **release:** forward secrets through reusable Central publisher ([0eca65f](https://github.com/elide-dev/bemo/commit/0eca65f8be68d18b6e185678e9d6b32b792d7e60))
+* **serving:** drop stale shard.connections entry on individual socket close ([#30](https://github.com/elide-dev/bemo/issues/30)) ([f5176b3](https://github.com/elide-dev/bemo/commit/f5176b3b821e325890a00516b619ce3993a64da3))
+
+
+### Performance Improvements
+
+* reuse initialized TLS output and retain benchmark symbols ([#17](https://github.com/elide-dev/bemo/issues/17)) ([a45d50b](https://github.com/elide-dev/bemo/commit/a45d50bf7548eed8798ece0f1023b65cd50fd751))
+* stop exact-capacity pool scans at recent matches ([#18](https://github.com/elide-dev/bemo/issues/18)) ([16805b3](https://github.com/elide-dev/bemo/commit/16805b3bbc01d1ae6bd5d79376a929392a27c483))
+
 ## [0.3.0](https://github.com/elide-dev/bemo/compare/v0.2.0...v0.3.0) (2026-10-08)
 
 
